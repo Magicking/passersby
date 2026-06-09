@@ -47,19 +47,58 @@ local dice_need_update = false
 local dice = {}
 local drift_dial
 
-local timbre = 0
-local wave_shape = {actual = 0, modu = 0, dirty = true}
-local wave_folds = {actual = 0, modu = 0, dirty = true}
-local fm1_amount = {actual = 0, modu = 0, dirty = true}
-local fm2_amount = {actual = 0, modu = 0, dirty = true}
-local attack = {actual = 0, modu = 0, dirty = true}
-local peak = {actual = 0, modu = 1, dirty = true}
-local decay = {actual = 0, modu = 0, dirty = true}
+local NUM_CHANNELS = 4
+local selected_ch = 1
+
+local timbre = 0  -- shared (per-MIDI-source aftertouch/timbre)
+
+-- Per-channel UI state. Holds actual/modu/dirty mirrors fed by polls and param actions.
+local voice_states = {}
+for c = 1, NUM_CHANNELS do
+  voice_states[c] = {
+    wave_shape = {actual = 0, modu = 0, dirty = true},
+    wave_folds = {actual = 0, modu = 0, dirty = true},
+    fm1_amount = {actual = 0, modu = 0, dirty = true},
+    fm2_amount = {actual = 0, modu = 0, dirty = true},
+    attack = {actual = 0, modu = 0, dirty = true},
+    peak = {actual = 0, modu = 1, dirty = true},
+    decay = {actual = 0, modu = 0, dirty = true},
+    lfo_shape = {dirty = true},
+    lfo_freq = {dirty = true},
+    lfo_destinations = {dirty = true},
+    drift = {actual = 0, dirty = true},
+  }
+end
+
+-- Aliases for selected channel; rebound when channel selection changes.
+local wave_shape, wave_folds, fm1_amount, fm2_amount, attack, peak, decay
+local lfo_shape, lfo_freq, lfo_destinations, drift
+
+-- Shared (reverb is one instance)
 local reverb_mix = {actual = 0, modu = 0, dirty = true}
-local lfo_shape = {dirty = true}
-local lfo_freq = {dirty = true}
-local lfo_destinations = {dirty = true}
-local drift = {actual = 0, dirty = true}
+
+local function bind_voice_state()
+  local s = voice_states[selected_ch]
+  wave_shape = s.wave_shape
+  wave_folds = s.wave_folds
+  fm1_amount = s.fm1_amount
+  fm2_amount = s.fm2_amount
+  attack = s.attack
+  peak = s.peak
+  decay = s.decay
+  lfo_shape = s.lfo_shape
+  lfo_freq = s.lfo_freq
+  lfo_destinations = s.lfo_destinations
+  drift = s.drift
+end
+
+-- Per-channel param helpers
+local function ch_prefix(ch) return "ch" .. ch .. "_" end
+local function prefix() return ch_prefix(selected_ch) end
+local function pget(id) return params:get(prefix() .. id) end
+local function pset(id, v) return params:set(prefix() .. id, v) end
+local function pdelta(id, d) return params:delta(prefix() .. id, d) end
+local function pstring(id) return params:string(prefix() .. id) end
 
 engine.name = "Passersby"
 
@@ -127,8 +166,8 @@ end
 
 local function generate_lfo_wave(x)
   
-  local lfo_shape = params:get("lfo_shape")
-  x = x * util.linlin(Passersby.specs.LFO_FREQ.minval, Passersby.specs.LFO_FREQ.maxval, 0.5, 10, params:get("lfo_freq"))
+  local lfo_shape = pget("lfo_shape")
+  x = x * util.linlin(Passersby.specs.LFO_FREQ.minval, Passersby.specs.LFO_FREQ.maxval, 0.5, 10, pget("lfo_freq"))
   
   if lfo_shape == 1 then -- Tri
     x = math.abs((x * 2 - 0.5) % 2 - 1) * 2 - 1
@@ -147,15 +186,15 @@ end
 
 local function update_lfo_amounts_list()
   lfo_amounts_list.entries = {
-    util.round(params:get("lfo_to_freq_amount") * 100, 1),
-    util.round(params:get("lfo_to_wave_shape_amount") * 100, 1),
-    util.round(params:get("lfo_to_wave_folds_amount") * 100, 1),
-    util.round(params:get("lfo_to_fm_low_amount") * 100, 1),
-    util.round(params:get("lfo_to_fm_high_amount") * 100, 1),
-    util.round(params:get("lfo_to_attack_amount") * 100, 1),
-    util.round(params:get("lfo_to_peak_amount") * 100, 1),
-    util.round(params:get("lfo_to_decay_amount") * 100, 1),
-    util.round(params:get("lfo_to_reverb_mix_amount") * 100, 1)
+    util.round(pget("lfo_to_freq_amount") * 100, 1),
+    util.round(pget("lfo_to_wave_shape_amount") * 100, 1),
+    util.round(pget("lfo_to_wave_folds_amount") * 100, 1),
+    util.round(pget("lfo_to_fm_low_amount") * 100, 1),
+    util.round(pget("lfo_to_fm_high_amount") * 100, 1),
+    util.round(pget("lfo_to_attack_amount") * 100, 1),
+    util.round(pget("lfo_to_peak_amount") * 100, 1),
+    util.round(pget("lfo_to_decay_amount") * 100, 1),
+    util.round(pget("lfo_to_reverb_mix_amount") * 100, 1)
   }
 end
 
@@ -190,7 +229,7 @@ end
 local function update_tabs()
   
   wave_graph:set_active(tabs.index == 1)
-  env_graph:set_active(tabs.index == 1 or params:get("env_type") == 2)
+  env_graph:set_active(tabs.index == 1 or pget("env_type") == 2)
   lfo_graph:set_active(tabs.index == 1)
   
   if tabs.index == 2 then env_status.text = "" end
@@ -221,20 +260,57 @@ local function init_env_graph(env_type)
   env_graph:set_show_x_axis(true)
 end
 
+local function on_channel_change()
+  bind_voice_state()
+
+  -- Mark every per-voice mirror dirty so update() recomputes for new channel
+  for _, st in pairs(voice_states[selected_ch]) do
+    st.dirty = true
+  end
+
+  -- Refresh static UI widgets
+  if fm1_dial then fm1_dial.value = fm1_amount.actual * 100 end
+  if fm2_dial then fm2_dial.value = fm2_amount.actual * 100 end
+  if drift_dial then drift_dial.value = pget("drift") * 100 end
+
+  -- Re-init env graph for new envelope type
+  init_env_graph(pget("env_type"))
+
+  -- Refresh tab titles for env type
+  if tab_titles and tabs then
+    tab_titles[2][1] = pstring("env_type")
+    if pget("env_type") == 1 then
+      tab_titles[2][2] = "Reverb"
+    else
+      tab_titles[2][2] = "Peak/Reverb"
+    end
+    if pages and pages.index == 2 then
+      tabs.titles = tab_titles[2]
+    end
+  end
+
+  if lfo_amounts_list then update_lfo_amounts_list() end
+  if wave_graph then wave_graph:update_functions() end
+  if lfo_graph then lfo_graph:update_functions() end
+
+  env_status.text = ""
+  screen_dirty = true
+end
+
 
 -- Engine functions
 
-local function note_on(note_num, vel)
-  engine.noteOn(note_num, MusicUtil.note_num_to_freq(note_num), vel)
-  table.insert(active_notes, note_num)
+local function note_on(ch, note_num, vel)
+  engine.noteOn(ch, note_num, MusicUtil.note_num_to_freq(note_num), vel)
+  table.insert(active_notes, {ch = ch, note = note_num})
   input_indicator_active = true
   screen_dirty = true
 end
 
-local function note_off(note_num)
-  engine.noteOff(note_num)
+local function note_off(ch, note_num)
+  engine.noteOff(ch, note_num)
   for i = #active_notes, 1, -1 do
-    if active_notes[i] == note_num then
+    if active_notes[i].ch == ch and active_notes[i].note == note_num then
       table.remove(active_notes, i)
     end
   end
@@ -244,53 +320,55 @@ local function note_off(note_num)
   end
 end
 
-local function set_pitch_bend(bend_st)
-  engine.pitchBendAll(MusicUtil.interval_to_ratio(bend_st))
+local function set_pitch_bend(ch, bend_st)
+  engine.pitchBendAll(ch, MusicUtil.interval_to_ratio(bend_st))
 end
 
-local function set_channel_pressure(pressure)
-  engine.pressureAll(pressure)
+local function set_channel_pressure(ch, pressure)
+  engine.pressureAll(ch, pressure)
 end
 
-local function set_channel_timbre(value)
-  engine.timbreAll(value)
-  timbre = value * 0.5
-  wave_folds.dirty = true
+local function set_channel_timbre(ch, value)
+  engine.timbreAll(ch, value)
+  if ch == selected_ch then
+    timbre = value * 0.5
+    voice_states[ch].wave_folds.dirty = true
+  end
 end
 
 -- Updaters
 
 local function update_wave_shape()
-  wave_shape.actual = util.clamp(params:get("wave_shape") + wave_shape.modu, Passersby.specs.WAVE_SHAPE.minval, Passersby.specs.WAVE_SHAPE.maxval)
+  wave_shape.actual = util.clamp(pget("wave_shape") + wave_shape.modu, Passersby.specs.WAVE_SHAPE.minval, Passersby.specs.WAVE_SHAPE.maxval)
   wave_graph:update_functions()
   wave_shape.dirty = false
   screen_dirty = true
 end
 
 local function update_wave_folds()
-  wave_folds.actual = util.clamp(params:get("wave_folds") + timbre + wave_folds.modu, Passersby.specs.WAVE_FOLDS.minval, Passersby.specs.WAVE_FOLDS.maxval + 0.5)
+  wave_folds.actual = util.clamp(pget("wave_folds") + timbre + wave_folds.modu, Passersby.specs.WAVE_FOLDS.minval, Passersby.specs.WAVE_FOLDS.maxval + 0.5)
   wave_graph:update_functions()
   wave_folds.dirty = false
   screen_dirty = true
 end
 
 local function update_fm1_amount()
-  fm1_amount.actual = util.clamp(params:get("fm_low_amount") + fm1_amount.modu, Passersby.specs.FM_LOW_AMOUNT.minval, Passersby.specs.FM_LOW_AMOUNT.maxval)
+  fm1_amount.actual = util.clamp(pget("fm_low_amount") + fm1_amount.modu, Passersby.specs.FM_LOW_AMOUNT.minval, Passersby.specs.FM_LOW_AMOUNT.maxval)
   fm1_dial.value = fm1_amount.actual * 100
   fm1_amount.dirty = false
   screen_dirty = true
 end
 
 local function update_fm2_amount()
-  fm2_amount.actual = util.clamp(params:get("fm_high_amount") + fm2_amount.modu, Passersby.specs.FM_HIGH_AMOUNT.minval, Passersby.specs.FM_HIGH_AMOUNT.maxval)
+  fm2_amount.actual = util.clamp(pget("fm_high_amount") + fm2_amount.modu, Passersby.specs.FM_HIGH_AMOUNT.minval, Passersby.specs.FM_HIGH_AMOUNT.maxval)
   fm2_dial.value = fm2_amount.actual * 100
   fm2_amount.dirty = false
   screen_dirty = true
 end
 
 local function update_attack()
-  attack.actual = util.clamp(params:get("attack") + attack.modu, Passersby.specs.ATTACK.minval, Passersby.specs.ATTACK.maxval)
-  if params:get("env_type") == 2 then
+  attack.actual = util.clamp(pget("attack") + attack.modu, Passersby.specs.ATTACK.minval, Passersby.specs.ATTACK.maxval)
+  if pget("env_type") == 2 then
     local norm_attack = util.explin(Passersby.specs.ATTACK.minval, Passersby.specs.ATTACK.maxval, 0, 0.4, attack.actual)
     env_graph:edit_asr(norm_attack)
   end
@@ -299,20 +377,20 @@ local function update_attack()
 end
 
 local function show_attack_status()
-  if params:get("env_type") == 2 then
-    local norm_attack = util.explin(Passersby.specs.ATTACK.minval, Passersby.specs.ATTACK.maxval, 0, 0.4, params:get("attack") + attack.modu)
-    local norm_peak = util.explin(Passersby.specs.PEAK.minval * 0.5, Passersby.specs.PEAK.maxval, 0, 1, params:get("peak") * peak.modu)
+  if pget("env_type") == 2 then
+    local norm_attack = util.explin(Passersby.specs.ATTACK.minval, Passersby.specs.ATTACK.maxval, 0, 0.4, pget("attack") + attack.modu)
+    local norm_peak = util.explin(Passersby.specs.PEAK.minval * 0.5, Passersby.specs.PEAK.maxval, 0, 1, pget("peak") * peak.modu)
     local y
     if norm_peak > 0.6 then y = 46 else y = util.linlin(0, 1, 52, 18, norm_peak) end
-    start_env_status_timeout(params:string("attack"), 38, y)
+    start_env_status_timeout(pstring("attack"), 38, y)
     screen_dirty = true
   end
 end
 
 local function update_peak()
-  peak.actual = util.clamp(params:get("peak") * peak.modu, Passersby.specs.PEAK.minval, Passersby.specs.PEAK.maxval)
+  peak.actual = util.clamp(pget("peak") * peak.modu, Passersby.specs.PEAK.minval, Passersby.specs.PEAK.maxval)
   local norm_peak = util.explin(Passersby.specs.PEAK.minval * 0.5, Passersby.specs.PEAK.maxval, 0, 1, peak.actual)
-  if params:get("env_type") == 1 then
+  if pget("env_type") == 1 then
     env_graph:edit_ar(nil, nil, norm_peak)
   else
     env_graph:edit_asr(nil, nil, norm_peak)
@@ -322,18 +400,18 @@ local function update_peak()
 end
 
 local function show_peak_status()
-  local norm_peak = util.explin(Passersby.specs.PEAK.minval * 0.5, Passersby.specs.PEAK.maxval, 0, 1, params:get("peak") * peak.modu)
-  if params:get("env_type") == 1 then
-    start_env_status_timeout(params:string("peak"), 57, util.linlin(0, 1, 56, 26, norm_peak))
+  local norm_peak = util.explin(Passersby.specs.PEAK.minval * 0.5, Passersby.specs.PEAK.maxval, 0, 1, pget("peak") * peak.modu)
+  if pget("env_type") == 1 then
+    start_env_status_timeout(pstring("peak"), 57, util.linlin(0, 1, 56, 26, norm_peak))
   else
-    start_env_status_timeout(params:string("peak"), 45, util.linlin(0, 1, 52, 18, norm_peak))
+    start_env_status_timeout(pstring("peak"), 45, util.linlin(0, 1, 52, 18, norm_peak))
   end
   screen_dirty = true
 end
 
 local function update_decay()
-  decay.actual = util.clamp(params:get("decay") + decay.modu, Passersby.specs.DECAY.minval, Passersby.specs.DECAY.maxval)
-  if params:get("env_type") == 1 then
+  decay.actual = util.clamp(pget("decay") + decay.modu, Passersby.specs.DECAY.minval, Passersby.specs.DECAY.maxval)
+  if pget("env_type") == 1 then
     local norm_decay = util.explin(Passersby.specs.DECAY.minval * 0.5, Passersby.specs.DECAY.maxval, 0, 1, decay.actual)
     env_graph:edit_ar(nil, norm_decay)
   else
@@ -346,15 +424,15 @@ end
 
 local function show_decay_status()
   local norm_decay
-  if params:get("env_type") == 1 then
-    norm_decay = util.explin(Passersby.specs.DECAY.minval * 0.5, Passersby.specs.DECAY.maxval, 0, 0.4, params:get("decay") + decay.modu)
-    start_env_status_timeout(params:string("decay"), util.linlin(0, 1, 38, 80, norm_decay), 48)
+  if pget("env_type") == 1 then
+    norm_decay = util.explin(Passersby.specs.DECAY.minval * 0.5, Passersby.specs.DECAY.maxval, 0, 0.4, pget("decay") + decay.modu)
+    start_env_status_timeout(pstring("decay"), util.linlin(0, 1, 38, 80, norm_decay), 48)
   else
-    norm_decay = util.explin(Passersby.specs.DECAY.minval, Passersby.specs.DECAY.maxval, 0.4, 0, params:get("decay") + decay.modu)
-    local norm_peak = util.explin(Passersby.specs.PEAK.minval * 0.5, Passersby.specs.PEAK.maxval, 0, 1, params:get("peak") * peak.modu)
+    norm_decay = util.explin(Passersby.specs.DECAY.minval, Passersby.specs.DECAY.maxval, 0.4, 0, pget("decay") + decay.modu)
+    local norm_peak = util.explin(Passersby.specs.PEAK.minval * 0.5, Passersby.specs.PEAK.maxval, 0, 1, pget("peak") * peak.modu)
     local y
     if norm_peak > 0.6 then y = 53 else y = util.linlin(0, 1, 52, 18, norm_peak) end
-    start_env_status_timeout(params:string("decay"), util.linlin(0, 1, 39, 74, norm_decay), y)
+    start_env_status_timeout(pstring("decay"), util.linlin(0, 1, 39, 74, norm_decay), y)
   end
   screen_dirty = true
 end
@@ -386,7 +464,7 @@ local function update_lfo_destinations()
 end
 
 local function update_drift()
-  drift_dial.value = params:get("drift") * 100
+  drift_dial.value = pget("drift") * 100
   drift.dirty = false
   screen_dirty = true
 end
@@ -404,162 +482,165 @@ function enc(n, delta)
   end
   
   if pages.index == 1 then
-    
+
       if tabs.index == 1 then
         -- Wave
         if n == 2 then
-          params:delta("wave_shape", delta)
+          pdelta("wave_shape", delta)
         elseif n == 3 then
-          params:delta("wave_folds", delta)
+          pdelta("wave_folds", delta)
         end
-        
+
       else
         -- FM
         if n == 2 then
-          params:delta("fm_low_amount", delta)
+          pdelta("fm_low_amount", delta)
         elseif n == 3 then
-          params:delta("fm_high_amount", delta)
+          pdelta("fm_high_amount", delta)
         end
       end
-      
+
   elseif pages.index == 2 then
-    
+
       if tabs.index == 1 then
         -- LPG
         if n == 2 then
-          if params:get("env_type") == 1 then
-            params:delta("peak", delta)
+          if pget("env_type") == 1 then
+            pdelta("peak", delta)
           else
-            params:delta("attack", delta)
+            pdelta("attack", delta)
           end
         elseif n == 3 then
-          if params:get("env_type") == 1 then
-            params:delta("decay", delta)
+          if pget("env_type") == 1 then
+            pdelta("decay", delta)
           else
-            params:delta("decay", -delta)
+            pdelta("decay", -delta)
           end
         end
-        
+
       else
         -- Peak
-        if n == 2 and params:get("env_type") == 2 then
-          params:delta("peak", delta)
-        -- Reverb
+        if n == 2 and pget("env_type") == 2 then
+          pdelta("peak", delta)
+        -- Reverb (shared)
         elseif n == 3 then
           params:delta("reverb_mix", delta)
         end
       end
-      
+
   elseif pages.index == 3 then
-    
+
     if tabs.index == 1 then
       -- LFO
       if n == 2 then
-        params:delta("lfo_shape", util.clamp(delta, -1, 1))
+        pdelta("lfo_shape", util.clamp(delta, -1, 1))
       elseif n == 3 then
-        params:delta("lfo_freq", delta)
+        pdelta("lfo_freq", delta)
       end
-    
+
     else
       -- LFO scroll lists
       if n == 2 then
         lfo_destinations_list:set_index_delta(util.clamp(delta, -1, 1), false)
         lfo_amounts_list:set_index(lfo_destinations_list.index)
         screen_dirty = true
-        
+
       -- LFO amounts
       elseif n == 3 then
         if lfo_destinations_list.index == 1 then
-          params:delta("lfo_to_freq_amount", delta)
+          pdelta("lfo_to_freq_amount", delta)
         elseif lfo_destinations_list.index == 2 then
-          params:delta("lfo_to_wave_shape_amount", delta)
+          pdelta("lfo_to_wave_shape_amount", delta)
         elseif lfo_destinations_list.index == 3 then
-          params:delta("lfo_to_wave_folds_amount", delta)
+          pdelta("lfo_to_wave_folds_amount", delta)
         elseif lfo_destinations_list.index == 4 then
-          params:delta("lfo_to_fm_low_amount", delta)
+          pdelta("lfo_to_fm_low_amount", delta)
         elseif lfo_destinations_list.index == 5 then
-          params:delta("lfo_to_fm_high_amount", delta)
+          pdelta("lfo_to_fm_high_amount", delta)
         elseif lfo_destinations_list.index == 6 then
-          params:delta("lfo_to_attack_amount", delta)
+          pdelta("lfo_to_attack_amount", delta)
         elseif lfo_destinations_list.index == 7 then
-          params:delta("lfo_to_peak_amount", delta)
+          pdelta("lfo_to_peak_amount", delta)
         elseif lfo_destinations_list.index == 8 then
-          params:delta("lfo_to_decay_amount", delta)
+          pdelta("lfo_to_decay_amount", delta)
         elseif lfo_destinations_list.index == 9 then
-          params:delta("lfo_to_reverb_mix_amount", delta)
+          pdelta("lfo_to_reverb_mix_amount", delta)
         end
       end
-      
+
     end
-      
+
   elseif pages.index == 4 then
-    
+
     -- Randomize
     if n == 2 then
       if not dice_thrown then set_dice_throw_vel(delta * 0.05) end
-      
+
     -- Drift
     elseif n == 3 then
-      params:delta("drift", delta)
+      pdelta("drift", delta)
     end
-    
+
   end
 end
 
 -- Key input
 function key(n, z)
   if z == 1 then
-    
-    if n == 2 then
+
+    if n == 1 then
+      selected_ch = (selected_ch % NUM_CHANNELS) + 1
+      on_channel_change()
+
+    elseif n == 2 then
       pages:set_index_delta(1, true)
       update_pages()
-      
+
     elseif n == 3 then
       tabs:set_index_delta(1, true)
       update_tabs()
-      
+
     end
   end
 end
 
 -- MIDI input
 local function midi_event(data)
-  
+
   local msg = midi.to_msg(data)
-  local channel_param = params:get("midi_channel")
-  
-  if channel_param == 1 or (channel_param > 1 and msg.ch == channel_param - 1) then
-    
-    -- Note on
-    if msg.type == "note_on" then
-      note_on(msg.note, msg.vel / 127)
-      
-    -- Note off
-    elseif msg.type == "note_off" then
-      note_off(msg.note)
-      
-    -- Pitch bend
-    elseif msg.type == "pitchbend" then
-      local bend_st = (util.round(msg.val / 2)) / 8192 * 2 -1 -- Convert to -1 to 1
-      set_pitch_bend(bend_st * params:get("bend_range"))
-      
-    -- Pressure
-    elseif msg.type == "channel_pressure" or msg.type == "key_pressure" then
-      set_channel_pressure(msg.val / 127)
-      
+  if msg.ch == nil then return end
+
+  for c = 1, NUM_CHANNELS do
+    local voice_midi_ch = params:get("ch" .. c .. "_midi_channel")
+    if voice_midi_ch > 0 and voice_midi_ch == msg.ch then
+
+      if msg.type == "note_on" then
+        note_on(c, msg.note, msg.vel / 127)
+
+      elseif msg.type == "note_off" then
+        note_off(c, msg.note)
+
+      elseif msg.type == "pitchbend" then
+        local bend_st = (util.round(msg.val / 2)) / 8192 * 2 - 1
+        set_pitch_bend(c, bend_st * params:get("bend_range"))
+
+      elseif msg.type == "channel_pressure" or msg.type == "key_pressure" then
+        set_channel_pressure(c, msg.val / 127)
+
+      end
     end
   end
 end
 
--- Grid input
+-- Grid input — plays on currently selected channel
 local function grid_key(x, y, z)
   local note_num = util.clamp(((7 - y) * 5) + x + 33, 0, 127)
-  
+
   if z == 1 then
-    note_on(note_num, 0.8)
+    note_on(selected_ch, note_num, 0.8)
     grid_device:led(x, y, 15)
   else
-    note_off(note_num)
+    note_off(selected_ch, note_num)
     grid_device:led(x, y, 0)
   end
   grid_device:refresh()
@@ -587,11 +668,7 @@ function init()
     midi_in_device = midi.connect(value)
     midi_in_device.event = midi_event
   end}
-  
-  local channels = {"All"}
-  for i = 1, 16 do table.insert(channels, i) end
-  params:add{type = "option", id = "midi_channel", name = "MIDI Channel", options = channels}
-  
+
   params:add{type = "number", id = "bend_range", name = "Pitch Bend Range", min = 1, max = 48, default = 2}
 
   params:add{type = "number", id = "grid_device", name = "Grid Device", min = 1, max = 4, default = 1,
@@ -604,142 +681,136 @@ function init()
       grid_dirty = true
     end}
   
-  Passersby.add_params()
-  
-  -- Override param actions
-  
-  params:set_action("wave_shape", function(value)
-    engine.waveShape(value)
-    wave_shape.dirty = true
-  end)
-  
-  params:set_action("wave_folds", function(value)
-    engine.waveFolds(value)
-    wave_folds.dirty = true
-  end)
-  
-  params:set_action("fm_low_amount", function(value)
-    engine.fm1Amount(value)
-    fm1_amount.dirty = true
-  end)
-  
-  params:set_action("fm_high_amount", function(value)
-    engine.fm2Amount(value)
-    fm2_amount.dirty = true
-  end)
-  
-  params:set_action("env_type", function(value)
-    engine.envType(value - 1)
-    init_env_graph(value)
-    tab_titles[2][1] = params:string("env_type")
-    if value == 1 then
-      tab_titles[2][2] = "Reverb"
-    else
-      tab_titles[2][2] = "Peak/Reverb"
+  Passersby.add_global_params()
+  for c = 1, NUM_CHANNELS do
+    Passersby.add_voice_params(c)
+  end
+  params:add{type = "trigger", id = "randomize_all", name = "Randomize All Channels", action = function()
+    for c = 1, NUM_CHANNELS do Passersby.randomize_params(c) end
+  end}
+  params:bang()
+
+  -- Override per-voice param actions for UI side effects
+  for c = 1, NUM_CHANNELS do
+    local p = ch_prefix(c)
+    local s = voice_states[c]
+
+    params:set_action(p .. "wave_shape", function(value)
+      engine.waveShape(c, value)
+      s.wave_shape.dirty = true
+    end)
+
+    params:set_action(p .. "wave_folds", function(value)
+      engine.waveFolds(c, value)
+      s.wave_folds.dirty = true
+    end)
+
+    params:set_action(p .. "fm_low_amount", function(value)
+      engine.fm1Amount(c, value)
+      s.fm1_amount.dirty = true
+    end)
+
+    params:set_action(p .. "fm_high_amount", function(value)
+      engine.fm2Amount(c, value)
+      s.fm2_amount.dirty = true
+    end)
+
+    params:set_action(p .. "env_type", function(value)
+      engine.envType(c, value - 1)
+      if c == selected_ch and pages then
+        init_env_graph(value)
+        tab_titles[2][1] = pstring("env_type")
+        if value == 1 then
+          tab_titles[2][2] = "Reverb"
+        else
+          tab_titles[2][2] = "Peak/Reverb"
+        end
+        if pages.index == 2 then
+          tabs.titles = tab_titles[2]
+          update_tabs()
+          screen_dirty = true
+        end
+      end
+    end)
+
+    params:set_action(p .. "attack", function(value)
+      engine.attack(c, value)
+      if c == selected_ch and pages and pages.index == 2 then show_attack_status() end
+      s.attack.dirty = true
+    end)
+
+    params:set_action(p .. "peak", function(value)
+      engine.peak(c, value)
+      if c == selected_ch and pages and pages.index == 2 then show_peak_status() end
+      s.peak.dirty = true
+    end)
+
+    params:set_action(p .. "decay", function(value)
+      engine.decay(c, value)
+      if c == selected_ch and pages and pages.index == 2 then show_decay_status() end
+      s.decay.dirty = true
+    end)
+
+    params:set_action(p .. "lfo_shape", function(value)
+      engine.lfoShape(c, value - 1)
+      s.lfo_shape.dirty = true
+    end)
+
+    params:set_action(p .. "lfo_freq", function(value)
+      engine.lfoFreq(c, value)
+      s.lfo_freq.dirty = true
+    end)
+
+    local lfo_dest_setters = {
+      {id = "lfo_to_freq_amount", fn = engine.lfoToFreqAmount},
+      {id = "lfo_to_wave_shape_amount", fn = engine.lfoToWaveShapeAmount},
+      {id = "lfo_to_wave_folds_amount", fn = engine.lfoToWaveFoldsAmount},
+      {id = "lfo_to_fm_low_amount", fn = engine.lfoToFm1Amount},
+      {id = "lfo_to_fm_high_amount", fn = engine.lfoToFm2Amount},
+      {id = "lfo_to_attack_amount", fn = engine.lfoToAttackAmount},
+      {id = "lfo_to_peak_amount", fn = engine.lfoToPeakAmount},
+      {id = "lfo_to_decay_amount", fn = engine.lfoToDecayAmount},
+      {id = "lfo_to_reverb_mix_amount", fn = engine.lfoToReverbMixAmount},
+    }
+    for _, dest in ipairs(lfo_dest_setters) do
+      params:set_action(p .. dest.id, function(value)
+        dest.fn(c, value)
+        s.lfo_destinations.dirty = true
+      end)
     end
-    if pages.index == 2 then
-      tabs.titles = tab_titles[2]
-      update_tabs()
-      screen_dirty = true
-    end
-  end)
-  
-  params:set_action("attack", function(value)
-    engine.attack(value)
-    if pages.index == 2 then show_attack_status() end
-    attack.dirty = true
-  end)
-  
-  params:set_action("peak", function(value)
-    engine.peak(value)
-    if pages.index == 2 then show_peak_status() end
-    peak.dirty = true
-  end)
-  
-  params:set_action("decay", function(value)
-    engine.decay(value)
-    if pages.index == 2 then show_decay_status() end
-    decay.dirty = true
-  end)
-  
+
+    params:set_action(p .. "drift", function(value)
+      engine.drift(c, value)
+      s.drift.dirty = true
+    end)
+  end
+
+  -- Reverb (shared)
   params:set_action("reverb_mix", function(value)
     engine.reverbMix(value)
     reverb_mix.dirty = true
   end)
-  
-  params:set_action("lfo_shape", function(value)
-    engine.lfoShape(value - 1)
-    lfo_shape.dirty = true
-  end)
-  
-  params:set_action("lfo_freq", function(value)
-    engine.lfoFreq(value)
-    lfo_freq.dirty = true
-  end)
-  
-  params:set_action("lfo_to_freq_amount", function(value)
-    engine.lfoToFreqAmount(value)
-    lfo_destinations.dirty = true
-  end)
-  
-  params:set_action("lfo_to_wave_shape_amount", function(value)
-    engine.lfoToWaveShapeAmount(value)
-    lfo_destinations.dirty = true
-  end)
-  
-  params:set_action("lfo_to_wave_folds_amount", function(value)
-    engine.lfoToWaveFoldsAmount(value)
-    lfo_destinations.dirty = true
-  end)
-  
-  params:set_action("lfo_to_fm_low_amount", function(value)
-    engine.lfoToFm1Amount(value)
-    lfo_destinations.dirty = true
-  end)
-  
-  params:set_action("lfo_to_fm_high_amount", function(value)
-    engine.lfoToFm2Amount(value)
-    lfo_destinations.dirty = true
-  end)
-  
-  params:set_action("lfo_to_attack_amount", function(value)
-    engine.lfoToAttackAmount(value)
-    lfo_destinations.dirty = true
-  end)
-  
-  params:set_action("lfo_to_peak_amount", function(value)
-    engine.lfoToPeakAmount(value)
-    lfo_destinations.dirty = true
-  end)
-  
-  params:set_action("lfo_to_decay_amount", function(value)
-    engine.lfoToDecayAmount(value)
-    lfo_destinations.dirty = true
-  end)
-  
-  params:set_action("lfo_to_reverb_mix_amount", function(value)
-    engine.lfoToReverbMixAmount(value)
-    lfo_destinations.dirty = true
-  end)
-  
-  params:set_action("drift", function(value)
-    engine.drift(value)
-    drift.dirty = true
-  end)
-  
-  wave_shape.actual = params:get("wave_shape")
-  wave_folds.actual = params:get("wave_folds")
-  fm1_amount.actual = params:get("fm_low_amount")
-  fm2_amount.actual = params:get("fm_high_amount")
-  attack.actual = params:get("attack")
-  peak.actual = params:get("peak")
-  decay.actual = params:get("decay")
+
+  -- Seed UI mirrors from current param values
+  for c = 1, NUM_CHANNELS do
+    local p = ch_prefix(c)
+    local s = voice_states[c]
+    s.wave_shape.actual = params:get(p .. "wave_shape")
+    s.wave_folds.actual = params:get(p .. "wave_folds")
+    s.fm1_amount.actual = params:get(p .. "fm_low_amount")
+    s.fm2_amount.actual = params:get(p .. "fm_high_amount")
+    s.attack.actual = params:get(p .. "attack")
+    s.peak.actual = params:get(p .. "peak")
+    s.decay.actual = params:get(p .. "decay")
+  end
   reverb_mix.actual = params:get("reverb_mix")
+
+  bind_voice_state()
   
   -- Init UI
   
   pages = UI.Pages.new(1, 4)
-  tab_titles[2][1] = params:string("env_type")
+  tab_titles[2][1] = pstring("env_type")
   tabs = UI.Tabs.new(1, tab_titles[pages.index])
   
   fm1_dial = UI.Dial.new(72, 19, 22, fm1_amount.actual * 100, 0, 100, 1)
@@ -759,7 +830,7 @@ function init()
   lfo_amounts_list.active = false
   update_lfo_amounts_list()
   
-  drift_dial = UI.Dial.new(85, 28, 22, params:get("drift") * 100, 0, 100, 1)
+  drift_dial = UI.Dial.new(85, 28, 22, pget("drift") * 100, 0, 100, 1)
 
   -- Init graphs
   
@@ -771,7 +842,7 @@ function init()
   end
   wave_graph:add_function(wave_func, SUB_SAMPLING)
   
-  init_env_graph(params:get("env_type"))
+  init_env_graph(pget("env_type"))
   
   lfo_graph = Graph.new(0, 1, "lin", -1, 1, "lin", nil, true, false)
   lfo_graph:set_position_and_size(8, 18, 49, 36)
@@ -789,65 +860,32 @@ function init()
   
   randomize_dice()
   
-  -- Init polls
-  
-  local wave_shape_poll = poll.set("waveShapeMod", function(value)
-    if wave_shape.modu ~= value then
-      wave_shape.modu = value
-      wave_shape.dirty = true
+  -- Init per-channel modulation polls (SC poll names suffixed with 0..NUM_CHANNELS-1)
+  for c = 1, NUM_CHANNELS do
+    local s = voice_states[c]
+    local suffix = "_" .. (c - 1)
+
+    local function bind_modu_poll(name, target)
+      local pl = poll.set(name .. suffix, function(value)
+        if target.modu ~= value then
+          target.modu = value
+          target.dirty = true
+        end
+      end)
+      pl:start()
     end
-  end)
-  wave_shape_poll:start()
-  
-  local wave_folds_poll = poll.set("waveFoldsMod", function(value)
-    if wave_folds.modu ~= value then
-      wave_folds.modu = value
-      wave_folds.dirty = true
-    end
-  end)
-  wave_folds_poll:start()
-  
-  local fm1_amount_poll = poll.set("fm1AmountMod", function(value)
-    if fm1_amount.modu ~= value then
-      fm1_amount.modu = value
-      fm1_amount.dirty = true
-    end
-  end)
-  fm1_amount_poll:start()
-  
-  local fm2_amount_poll = poll.set("fm2AmountMod", function(value)
-    if fm2_amount.modu ~= value then
-      fm2_amount.modu = value
-      fm2_amount.dirty = true
-    end
-  end)
-  fm2_amount_poll:start()
-  
-  local attack_poll = poll.set("attackMod", function(value)
-    if attack.modu ~= value then
-      attack.modu = value
-      attack.dirty = true
-    end
-  end)
-  attack_poll:start()
-  
-  local peak_poll = poll.set("peakMulMod", function(value)
-    if peak.modu ~= value then
-      peak.modu = value
-      peak.dirty = true
-    end
-  end)
-  peak_poll:start()
-  
-  local decay_poll = poll.set("decayMod", function(value)
-    if decay.modu ~= value then
-      decay.modu = value
-      decay.dirty = true
-    end
-  end)
-  decay_poll:start()
-  
-  local reverb_mix_poll = poll.set("reverbMixMod", function(value)
+
+    bind_modu_poll("waveShapeMod", s.wave_shape)
+    bind_modu_poll("waveFoldsMod", s.wave_folds)
+    bind_modu_poll("fm1AmountMod", s.fm1_amount)
+    bind_modu_poll("fm2AmountMod", s.fm2_amount)
+    bind_modu_poll("attackMod", s.attack)
+    bind_modu_poll("peakMulMod", s.peak)
+    bind_modu_poll("decayMod", s.decay)
+  end
+
+  -- Reverb is shared and reads ch 0's LFO bus in the engine; subscribe to that channel's reverb-mix mod
+  local reverb_mix_poll = poll.set("reverbMixMod_0", function(value)
     if reverb_mix.modu ~= value then
       reverb_mix.modu = value
       reverb_mix.dirty = true
@@ -1017,7 +1055,7 @@ local function update_dice()
     if dice_throw_progress > 0.9 then
       dice_thrown = true
       randomize_dice()
-      Passersby.randomize_params()
+      Passersby.randomize_params(selected_ch)
       set_dice_throw_vel(-0.3)
     else
       set_dice_throw_vel(util.linlin(0, 1, -0.02, -0.03, dice_throw_progress))
@@ -1062,7 +1100,15 @@ function redraw()
   
   pages:redraw()
   tabs:redraw()
-  
+
+  -- Channel indicator (top-left): 1 2 3 4 with selected lit
+  for c = 1, NUM_CHANNELS do
+    if c == selected_ch then screen.level(15) else screen.level(3) end
+    screen.move((c - 1) * 6 + 2, 6)
+    screen.text(c)
+  end
+  screen.fill()
+
   if input_indicator_active then draw_input_indicator() end
   
   -- draw_background_rects()
@@ -1101,7 +1147,7 @@ function redraw()
     lfo_graph:redraw()
     screen.level(3)
     screen.move(8, 62)
-    screen.text(params:string("lfo_freq"))
+    screen.text(pstring("lfo_freq"))
     
     -- LFO Targets
     if tabs.index == 2 then screen.level(15) else screen.level(3) end
