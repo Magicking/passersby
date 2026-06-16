@@ -4,7 +4,7 @@
 
 Engine_Passersby : CroneEngine {
 
-	var numChannels = 4;
+	var numChannels = 8;
 
 	var lfosArr;
 	var synthVoices;

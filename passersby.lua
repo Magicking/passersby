@@ -25,7 +25,7 @@ local active_notes = {}
 
 local pages
 local tabs
-local tab_titles = {{"Wave", "FM"}, {"Env", "Reverb"}, {"LFO", "Targets"}, {"Fate"}}
+local tab_titles = {{"Wave", "FM"}, {"Env", "Reverb"}, {"LFO", "Targets"}, {"Fate", "Filter"}}
 
 local input_indicator_active = false
 local wave_table = {}
@@ -47,14 +47,16 @@ local dice_need_update = false
 local dice = {}
 local drift_dial
 
-local NUM_CHANNELS = 4
+local MAX_CHANNELS = 8
+local NUM_CHANNELS = 1
 local selected_ch = 1
+local filter_list_index = 1
 
 local timbre = 0  -- shared (per-MIDI-source aftertouch/timbre)
 
 -- Per-channel UI state. Holds actual/modu/dirty mirrors fed by polls and param actions.
 local voice_states = {}
-for c = 1, NUM_CHANNELS do
+for c = 1, MAX_CHANNELS do
   voice_states[c] = {
     wave_shape = {actual = 0, modu = 0, dirty = true},
     wave_folds = {actual = 0, modu = 0, dirty = true},
@@ -228,15 +230,15 @@ end
 
 local function update_tabs()
   
-  wave_graph:set_active(tabs.index == 1)
-  env_graph:set_active(tabs.index == 1 or pget("env_type") == 2)
-  lfo_graph:set_active(tabs.index == 1)
+  wave_graph:set_active(pages.index == 1 and tabs.index == 1)
+  env_graph:set_active(pages.index == 2 and (tabs.index == 1 or pget("env_type") == 2))
+  lfo_graph:set_active(pages.index == 3 and tabs.index == 1)
   
   if tabs.index == 2 then env_status.text = "" end
-  lfo_destinations_list.active = tabs.index == 2
-  lfo_amounts_list.active = tabs.index == 2
-  fm1_dial.active = tabs.index == 2
-  fm2_dial.active = tabs.index == 2
+  lfo_destinations_list.active = (pages.index == 3 and tabs.index == 2)
+  lfo_amounts_list.active = (pages.index == 3 and tabs.index == 2)
+  fm1_dial.active = (pages.index == 1 and tabs.index == 2)
+  fm2_dial.active = (pages.index == 1 and tabs.index == 2)
   
   screen_dirty = true
 end
@@ -301,20 +303,39 @@ end
 -- Engine functions
 
 local function note_on(ch, note_num, vel)
-  engine.noteOn(ch, note_num, MusicUtil.note_num_to_freq(note_num), vel)
-  table.insert(active_notes, {ch = ch, note = note_num})
-  input_indicator_active = true
-  screen_dirty = true
+  local prob = params:get("ch" .. ch .. "_play_probability")
+  if math.random(100) <= prob then
+    engine.noteOn(ch, note_num, MusicUtil.note_num_to_freq(note_num), vel)
+    table.insert(active_notes, {ch = ch, note = note_num, played = true})
+    input_indicator_active = true
+    screen_dirty = true
+  else
+    table.insert(active_notes, {ch = ch, note = note_num, played = false})
+  end
 end
 
 local function note_off(ch, note_num)
-  engine.noteOff(ch, note_num)
+  local was_played = false
   for i = #active_notes, 1, -1 do
     if active_notes[i].ch == ch and active_notes[i].note == note_num then
+      was_played = active_notes[i].played
       table.remove(active_notes, i)
+      break
     end
   end
-  if #active_notes == 0 then
+  
+  if was_played then
+    engine.noteOff(ch, note_num)
+  end
+  
+  local active_played_notes = 0
+  for i = 1, #active_notes do
+    if active_notes[i].played then
+      active_played_notes = active_played_notes + 1
+    end
+  end
+  
+  if active_played_notes == 0 then
     input_indicator_active = false
     screen_dirty = true
   end
@@ -572,13 +593,42 @@ function enc(n, delta)
 
   elseif pages.index == 4 then
 
-    -- Randomize
-    if n == 2 then
-      if not dice_thrown then set_dice_throw_vel(delta * 0.05) end
+    if tabs.index == 1 then
+      -- Randomize
+      if n == 2 then
+        if not dice_thrown then set_dice_throw_vel(delta * 0.05) end
 
-    -- Drift
-    elseif n == 3 then
-      pdelta("drift", delta)
+      -- Drift
+      elseif n == 3 then
+        pdelta("drift", delta)
+      end
+    else
+      -- Filter/Input tab
+      if n == 2 then
+        filter_list_index = util.clamp(filter_list_index + delta, 1, 4)
+        screen_dirty = true
+      elseif n == 3 then
+        if filter_list_index == 1 then
+          pdelta("midi_channel", delta)
+        elseif filter_list_index == 2 then
+          pdelta("play_probability", delta)
+        elseif filter_list_index == 3 then
+          pdelta("midi_note_min", delta)
+          local note_min = pget("midi_note_min")
+          local note_max = pget("midi_note_max")
+          if note_min > note_max then
+            pset("midi_note_max", note_min)
+          end
+        elseif filter_list_index == 4 then
+          pdelta("midi_note_max", delta)
+          local note_min = pget("midi_note_min")
+          local note_max = pget("midi_note_max")
+          if note_max < note_min then
+            pset("midi_note_min", note_max)
+          end
+        end
+        screen_dirty = true
+      end
     end
 
   end
@@ -615,7 +665,11 @@ local function midi_event(data)
     if voice_midi_ch > 0 and voice_midi_ch == msg.ch then
 
       if msg.type == "note_on" then
-        note_on(c, msg.note, msg.vel / 127)
+        local note_min = params:get("ch" .. c .. "_midi_note_min")
+        local note_max = params:get("ch" .. c .. "_midi_note_max")
+        if msg.note >= note_min and msg.note <= note_max then
+          note_on(c, msg.note, msg.vel / 127)
+        end
 
       elseif msg.type == "note_off" then
         note_off(c, msg.note)
@@ -680,9 +734,18 @@ function init()
       grid_device.key = grid_key
       grid_dirty = true
     end}
+
+  params:add{type = "number", id = "num_channels", name = "Number of Channels", min = 1, max = 8, default = 1, action = function(value)
+    NUM_CHANNELS = value
+    if selected_ch > NUM_CHANNELS then
+      selected_ch = NUM_CHANNELS
+      on_channel_change()
+    end
+    screen_dirty = true
+  end}
   
   Passersby.add_global_params()
-  for c = 1, NUM_CHANNELS do
+  for c = 1, MAX_CHANNELS do
     Passersby.add_voice_params(c)
   end
   params:add{type = "trigger", id = "randomize_all", name = "Randomize All Channels", action = function()
@@ -691,7 +754,7 @@ function init()
   params:bang()
 
   -- Override per-voice param actions for UI side effects
-  for c = 1, NUM_CHANNELS do
+  for c = 1, MAX_CHANNELS do
     local p = ch_prefix(c)
     local s = voice_states[c]
 
@@ -792,7 +855,7 @@ function init()
   end)
 
   -- Seed UI mirrors from current param values
-  for c = 1, NUM_CHANNELS do
+  for c = 1, MAX_CHANNELS do
     local p = ch_prefix(c)
     local s = voice_states[c]
     s.wave_shape.actual = params:get(p .. "wave_shape")
@@ -860,8 +923,8 @@ function init()
   
   randomize_dice()
   
-  -- Init per-channel modulation polls (SC poll names suffixed with 0..NUM_CHANNELS-1)
-  for c = 1, NUM_CHANNELS do
+  -- Init per-channel modulation polls (SC poll names suffixed with 0..MAX_CHANNELS-1)
+  for c = 1, MAX_CHANNELS do
     local s = voice_states[c]
     local suffix = "_" .. (c - 1)
 
@@ -1156,14 +1219,76 @@ function redraw()
     
   elseif pages.index == 4 then
     
-    -- Dice
-    draw_dice()
-    
-    -- Drift
-    screen.move(96, 23)
-    screen.text_center("Drift")
-    screen.fill()
-    drift_dial:redraw()
+    if tabs.index == 1 then
+      -- Dice
+      draw_dice()
+      
+      -- Drift
+      screen.move(96, 23)
+      screen.text_center("Drift")
+      screen.fill()
+      drift_dial:redraw()
+    else
+      -- Filter/Input tab
+      local filter_items = {"MIDI Ch", "Play Prob", "Note Min", "Note Max"}
+      for i = 1, #filter_items do
+        if i == filter_list_index then
+          screen.level(15)
+        else
+          screen.level(3)
+        end
+        screen.move(8, 18 + (i - 1) * 11 + 8)
+        screen.text(filter_items[i])
+        
+        -- Draw the value
+        screen.move(70, 18 + (i - 1) * 11 + 8)
+        local val_str = ""
+        if i == 1 then
+          local val = pget("midi_channel")
+          val_str = val == 0 and "Off" or tostring(val)
+        elseif i == 2 then
+          val_str = pget("play_probability") .. "%"
+        elseif i == 3 then
+          val_str = MusicUtil.note_num_to_name(pget("midi_note_min"), true)
+        elseif i == 4 then
+          val_str = MusicUtil.note_num_to_name(pget("midi_note_max"), true)
+        end
+        screen.text_right(val_str)
+      end
+
+      -- Probability Bar (x = 85, y = 20, width = 8, height = 30)
+      local prob = pget("play_probability")
+      local bar_h = math.floor(prob / 100 * 30)
+      screen.level(3)
+      screen.rect(85, 20, 8, 30)
+      screen.stroke()
+      if bar_h > 0 then
+        screen.level(15)
+        screen.rect(85, 20 + 30 - bar_h, 8, bar_h)
+        screen.fill()
+      end
+      screen.level(3)
+      screen.move(89, 60)
+      screen.text_center("Prob")
+
+      -- Note Range Bar (x = 108, y = 20, width = 8, height = 30)
+      local note_min = pget("midi_note_min")
+      local note_max = pget("midi_note_max")
+      local min_y = math.floor(note_min / 127 * 30)
+      local max_y = math.floor(note_max / 127 * 30)
+      screen.level(3)
+      screen.rect(108, 20, 8, 30)
+      screen.stroke()
+      local active_h = max_y - min_y
+      if active_h >= 0 then
+        screen.level(15)
+        screen.rect(108, 20 + 30 - max_y, 8, math.max(active_h, 1))
+        screen.fill()
+      end
+      screen.level(3)
+      screen.move(112, 60)
+      screen.text_center("Note")
+    end
     
   end
   

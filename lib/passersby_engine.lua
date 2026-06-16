@@ -7,6 +7,7 @@
 
 local ControlSpec = require "controlspec"
 local Formatters = require "formatters"
+local MusicUtil = require "musicutil"
 
 local Passersby = {}
 
@@ -27,6 +28,7 @@ specs.REVERB_MIX = ControlSpec.UNIPOLAR
 specs.LFO_FREQ = ControlSpec.new(0.001, 10.0, "exp", 0, 0.5, "Hz")
 specs.LFO_AMOUNT = ControlSpec.UNIPOLAR
 specs.DRIFT = ControlSpec.UNIPOLAR
+specs.PLAY_PROBABILITY = ControlSpec.new(0, 100, "lin", 1, 100, "%")
 
 Passersby.specs = specs
 
@@ -73,6 +75,12 @@ function Passersby.add_voice_params(ch)
   params:add_separator(label .. " — Input")
   params:add{type = "number", id = prefix .. "midi_channel", name = label .. " MIDI Channel", min = 0, max = 16, default = ch,
     formatter = function(p) local v = p:get(); if v == 0 then return "Off" else return tostring(v) end end}
+  params:add{type = "control", id = prefix .. "play_probability", name = label .. " Play Probability", controlspec = specs.PLAY_PROBABILITY,
+    formatter = function(param) return param:get() .. "%" end}
+  params:add{type = "number", id = prefix .. "midi_note_min", name = label .. " MIDI Note Min", min = 0, max = 127, default = 0,
+    formatter = function(p) return MusicUtil.note_num_to_name(p:get(), true) .. " (" .. p:get() .. ")" end}
+  params:add{type = "number", id = prefix .. "midi_note_max", name = label .. " MIDI Note Max", min = 0, max = 127, default = 127,
+    formatter = function(p) return MusicUtil.note_num_to_name(p:get(), true) .. " (" .. p:get() .. ")" end}
 
   params:add_separator(label .. " — Oscillators")
   params:add{type = "control", id = prefix .. "glide", name = label .. " Glide", controlspec = specs.GLIDE, action = function(v) engine.glide(ch, v) end}
